@@ -1,0 +1,45 @@
+# 敏感信息
+.env
+.env.local
+config.ini
+*.key
+
+# Python 项目
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# 虚拟环境
+venv/
+env/
+envs/
+
+# 数据集
+dataset/
+
+# 输出结果和权重
+output_inf30_skip4/
+reconstruction_results/
+output_*/
+
+# 模型权重文件
+*.pth
+*.pt
+*.ckpt
+InfMAE.pth
+
+# 图片文件
+*.png
+*.jpg
+*.jpeg
+
+# 日志
+*.log
+
+# IDE
+.vscode/
+.idea/
+.autodl/
+
+# 其他
+miniconda3/
