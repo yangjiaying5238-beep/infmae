@@ -1,96 +1,101 @@
 import torch
 import torchvision.transforms as transforms
 from PIL import Image
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 from skimage.metrics import peak_signal_noise_ratio as psnr
 from skimage.metrics import structural_similarity as ssim
-import os
+import os, random, time
 import models_infmae_skip4
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Using device:", device)
+# ============ 配置 ============
+CHECKPOINT_PATH = "/root/autodl-tmp/output_new/checkpoint-49.pth"  # 新权重
+IMG_FOLDER      = "/root/autodl-tmp/dataset/dataset/Inf30"
+OUTPUT_FOLDER   = "reconstruction_results_new"   # 新文件夹，和baseline区分
+MASK_RATIO      = 0.75
+TEST_NUM        = 500
+SEED            = 42   # 和baseline一样的seed，保证同一批图片
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# 加载模型
-model_name = 'infmae_vit_base_patch16_dec512d8b'
-checkpoint_path = "InfMAE.pth"
+IMG_MEAN = [0.425, 0.425, 0.425]
+IMG_STD  = [0.200, 0.200, 0.200]
 
-model = models_infmae_skip4.__dict__[model_name]()
-checkpoint = torch.load(checkpoint_path, map_location=device)
-model.load_state_dict(checkpoint['model'], strict=False)
-model.to(device)
-model.eval()
-print("Model loaded.")
+# ============ 收集图片（同baseline）============
+img_list = []
+for root, dirs, files in os.walk(IMG_FOLDER):
+    for f in files:
+        if f.lower().endswith((".png", ".jpg", ".jpeg")):
+            img_list.append(os.path.join(root, f))
 
-# 归一化参数（与训练一致）
-mean = torch.tensor([0.425, 0.425, 0.425]).view(3, 1, 1).to(device)
-std  = torch.tensor([0.200, 0.200, 0.200]).view(3, 1, 1).to(device)
+random.seed(SEED)
+random.shuffle(img_list)
+test_list = img_list[:TEST_NUM]
+print(f"测试集: {len(test_list)} 张")
 
+# ============ 加载新模型 ============
+model = models_infmae_skip4.__dict__['infmae_vit_base_patch16_dec512d8b']()
+ckpt = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
+model.load_state_dict(ckpt.get('model', ckpt), strict=False)
+model.to(DEVICE).eval()
+print("新模型加载完成")
+
+mean_t = torch.tensor(IMG_MEAN).view(3,1,1).to(DEVICE)
+std_t  = torch.tensor(IMG_STD ).view(3,1,1).to(DEVICE)
 transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.425, 0.425, 0.425],
-                         std=[0.200, 0.200, 0.200]),
+    transforms.Normalize(mean=IMG_MEAN, std=IMG_STD),
 ])
 
-img_list = ["/root/autodl-tmp/00001.png"]
-output_folder = "reconstruction_results"
-os.makedirs(output_folder, exist_ok=True)
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-# # 递归找jpg（兼容ImageFolder结构）
-# img_list = []
-# for root, dirs, files in os.walk(img_folder):
-#     for f in files:
-#         if f.endswith(".jpg") or f.endswith(".png"):
-#             img_list.append(os.path.join(root, f))
-# img_list = img_list[:10]
+# ============ 评估 ============
+psnr_list, ssim_list = [], []
+t0 = time.time()
 
-for img_path in img_list:
+for idx, img_path in enumerate(test_list):
     img_name = os.path.basename(img_path)
-    img = Image.open(img_path).convert("RGB")
-    img_tensor = transform(img).unsqueeze(0).to(device)
+    try:
+        img = Image.open(img_path).convert("RGB")
+    except:
+        continue
 
+    x = transform(img).unsqueeze(0).to(DEVICE)
     with torch.no_grad():
-        loss, pred, mask = model(img_tensor, mask_ratio=0.75)
+        loss, pred, mask = model(x, mask_ratio=MASK_RATIO)
 
-    print(f"pred shape: {pred.shape}, mask shape: {mask.shape}")  # 调试用
+    recon    = model.unpatchify(pred)
+    mask_3d  = mask.unsqueeze(-1).repeat(1, 1, 16*16*3)
+    mask_img = model.unpatchify(mask_3d)
+    full     = x * (1 - mask_img) + recon * mask_img
 
-    # 重建图像
-    recon = model.unpatchify(pred)  # [1, 3, 224, 224]
+    def to_np(t):
+        return np.clip((t * std_t + mean_t).permute(1,2,0).cpu().numpy(), 0, 1)
 
-    # 生成mask图（像素级）
-    patch_size = 16
-    mask_patch = mask.unsqueeze(-1).repeat(1, 1, patch_size * patch_size * 3)
-    mask_img = model.unpatchify(mask_patch)  # [1, 3, 224, 224]
+    orig_np = to_np(x.squeeze(0))
+    full_np = to_np(full.squeeze(0))
 
-    # 合成：保留原图未被mask部分 + 重建被mask部分
-    img_full = img_tensor * (1 - mask_img) + recon * mask_img
+    pv = psnr(orig_np, full_np, data_range=1.0)
+    sv = ssim(orig_np, full_np, channel_axis=2, data_range=1.0)
+    psnr_list.append(pv)
+    ssim_list.append(sv)
 
-    # 反归一化，用于可视化和计算指标
-    def denorm(t):
-        return torch.clamp(t * std + mean, 0, 1)
+    if (idx+1) % 50 == 0 or idx == 0:
+        print(f"[{idx+1}/{len(test_list)}] PSNR:{pv:.2f} SSIM:{sv:.4f}")
 
-    orig_np   = denorm(img_tensor.squeeze(0)).permute(1,2,0).cpu().numpy()
-    full_np   = denorm(img_full.squeeze(0)).permute(1,2,0).cpu().numpy()
-    recon_np  = denorm(recon.squeeze(0)).permute(1,2,0).cpu().numpy()
-    recon_np  = np.clip(recon_np, 0, 1)
-
-    # 指标计算
-    psnr_value = psnr(orig_np, full_np, data_range=1.0)
-    ssim_value = ssim(orig_np, full_np, channel_axis=2, data_range=1.0)
-    print(f"{img_name} -> PSNR: {psnr_value:.2f}, SSIM: {ssim_value:.4f}, Loss: {loss.item():.4f}")
-
-    # 可视化：原图 / masked图 / 重建图
-    masked_np = denorm((img_tensor * (1 - mask_img)).squeeze(0)).permute(1,2,0).cpu().numpy()
-    masked_np = np.clip(masked_np, 0, 1)
-
-    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
-    axes[0].imshow(orig_np);   axes[0].set_title("Original");    axes[0].axis("off")
-    axes[1].imshow(masked_np); axes[1].set_title("Masked Input"); axes[1].axis("off")
-    axes[2].imshow(full_np);   axes[2].set_title(f"Reconstruction\nPSNR:{psnr_value:.2f} SSIM:{ssim_value:.4f}"); axes[2].axis("off")
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_folder, f"compare_{img_name}"))
-    plt.close(fig)
-
-print("Done. Results saved in:", output_folder)
+# ============ 汇总对比 ============
+print("\n" + "="*45)
+print("改进后结果：")
+print(f"  平均 PSNR : {np.mean(psnr_list):.4f} dB")
+print(f"  平均 SSIM : {np.mean(ssim_list):.6f}")
+print("="*45)
+print("Baseline：")
+print(f"  平均 PSNR : 32.4199 dB")
+print(f"  平均 SSIM : 0.894708")
+print("="*45)
+diff_psnr = np.mean(psnr_list) - 32.4199
+diff_ssim = np.mean(ssim_list) - 0.894708
+print(f"PSNR 变化: {diff_psnr:+.4f} dB")
+print(f"SSIM 变化: {diff_ssim:+.6f}")
